@@ -84,15 +84,21 @@ def banner(title: str) -> None:
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]"))
 
 
-def require_api_key() -> None:
+def require_model_credentials() -> None:
+    """Skip the key check for local providers (vLLM) that don't need one."""
+    from memtree.kernel import DEFAULT_MODEL_ID
+
+    if DEFAULT_MODEL_ID.startswith("hosted_vllm/"):
+        return
     if not os.environ.get("GEMINI_API_KEY"):
         console.print(
             Panel.fit(
                 "GEMINI_API_KEY is not set.\n"
-                "Get a free key at https://aistudio.google.com/apikey, then either\n"
-                "  • `cp .env.example .env` and put the key in `.env`, or\n"
-                "  • `export GEMINI_API_KEY=...` in your shell.",
-                title="Missing API key",
+                "Either put a Gemini key in `.env` (cp .env.example .env), or set\n"
+                "  MEMTREE_MODEL_ID=hosted_vllm/<HF-model-id>\n"
+                "  MEMTREE_API_BASE=http://localhost:8000/v1\n"
+                "in `.env` to point at a local vLLM server.",
+                title="Missing credentials",
                 border_style="red",
             )
         )
@@ -224,7 +230,7 @@ def demo_synthesis(docs: dict[str, str], conn: Any, briefs: list[LabBrief]) -> C
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    require_api_key()
+    require_model_credentials()
     demo_typed_submit_guardrail()
 
     docs, conn = load_corpus()

@@ -33,6 +33,8 @@ def spawn_agent(
     model: Any | None = None,
     max_steps: int | None = None,
     additional_authorized_imports: list[str] | None = None,
+    run_logger: Any | None = None,
+    agent_label: str = "sub",
 ) -> Any:
     """Spin up a sub-CodeAgent, inject scope, run synchronously, return its typed result."""
     sub = build_agent(
@@ -41,11 +43,18 @@ def spawn_agent(
         final_answer_type=return_type,
         scope=scope,
         additional_authorized_imports=additional_authorized_imports,
+        run_logger=run_logger,
+        agent_label=agent_label,
     )
+    if run_logger is not None:
+        run_logger.event("spawn_start", {"agent": agent_label, "task": task[:400]})
     run_kwargs: dict[str, Any] = {}
     if max_steps is not None:
         run_kwargs["max_steps"] = max_steps
-    return sub.run(task, **run_kwargs)
+    result = sub.run(task, **run_kwargs)
+    if run_logger is not None:
+        run_logger.event("spawn_done", {"agent": agent_label, "result": result})
+    return result
 
 
 def spawn_agents(
@@ -56,16 +65,20 @@ def spawn_agents(
     max_workers: int | None = None,
     max_steps: int | None = None,
     additional_authorized_imports: list[str] | None = None,
+    run_logger: Any | None = None,
+    label_prefix: str = "sub",
 ) -> list[Any]:
     """Run a batch of sub-agents in parallel via a thread pool.
 
     Each `job` is a dict with at minimum a `task` key and an optional `scope` dict.
-    Per-job `return_type`/`tools` override the batch defaults.
+    Per-job `return_type`/`tools` override the batch defaults. A per-job
+    `agent_label` overrides the auto-generated `{label_prefix}-{i}` log tag.
     """
     if not jobs:
         return []
 
-    def _run_one(job: dict[str, Any]) -> Any:
+    def _run_one(indexed: tuple[int, dict[str, Any]]) -> Any:
+        i, job = indexed
         return spawn_agent(
             task=job["task"],
             scope=job.get("scope"),
@@ -76,7 +89,9 @@ def spawn_agents(
             additional_authorized_imports=job.get(
                 "additional_authorized_imports", additional_authorized_imports
             ),
+            run_logger=run_logger,
+            agent_label=job.get("agent_label", f"{label_prefix}-{i}"),
         )
 
     with ThreadPoolExecutor(max_workers=max_workers or len(jobs)) as pool:
-        return list(pool.map(_run_one, jobs))
+        return list(pool.map(_run_one, enumerate(jobs)))

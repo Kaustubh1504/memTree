@@ -24,10 +24,11 @@ from rich.rule import Rule
 # Load `.env` from the project root if present. Shell env still wins (override=False).
 load_dotenv(override=False)
 
-from memtree import build_agent, spawn_agents
+from memtree import WorkspaceRepo, build_agent, spawn_agents
 from memtree.corpus import load_corpus
 from memtree.kernel import build_model
 from memtree.primitives.typed_submit import TypedFinalAnswerError, TypedFinalAnswerTool
+from memtree.run_log import RunLogger
 from memtree.tools.query_db import query_db
 from memtree.tools.read_section import read_section
 from memtree.tools.save_finding import save_finding
@@ -85,19 +86,28 @@ def banner(title: str) -> None:
 
 
 def require_model_credentials() -> None:
-    """Skip the key check for local providers (vLLM) that don't need one."""
+    """Check the env var that matches the selected provider."""
     from memtree.kernel import DEFAULT_MODEL_ID
 
-    if DEFAULT_MODEL_ID.startswith("hosted_vllm/"):
-        return
-    if not os.environ.get("GEMINI_API_KEY"):
+    if DEFAULT_MODEL_ID.startswith(("hosted_vllm/", "ollama_chat/", "ollama/")):
+        return  # local providers need no key
+    if DEFAULT_MODEL_ID.startswith("xai/"):
+        required, hint = "XAI_API_KEY", "https://console.x.ai/"
+    elif DEFAULT_MODEL_ID.startswith("groq/"):
+        required, hint = "GROQ_API_KEY", "https://console.groq.com/keys"
+    elif DEFAULT_MODEL_ID.startswith("openai/"):
+        # Covers DashScope/Qwen-Cloud via OpenAI-compatible endpoint.
+        required, hint = "OPENAI_API_KEY", "https://bailian.console.alibabacloud.com/ (DashScope)"
+    else:
+        required, hint = "GEMINI_API_KEY", "https://aistudio.google.com/apikey"
+
+    if not os.environ.get(required):
         console.print(
             Panel.fit(
-                "GEMINI_API_KEY is not set.\n"
-                "Either put a Gemini key in `.env` (cp .env.example .env), or set\n"
-                "  MEMTREE_MODEL_ID=hosted_vllm/<HF-model-id>\n"
-                "  MEMTREE_API_BASE=http://localhost:8000/v1\n"
-                "in `.env` to point at a local vLLM server.",
+                f"{required} is not set.\n"
+                f"Get a key at {hint} and add it to `.env`\n"
+                "(`cp .env.example .env` for the template). Pick the provider\n"
+                "section in `.env.example` that matches the model you want.",
                 title="Missing credentials",
                 border_style="red",
             )
@@ -124,7 +134,7 @@ def demo_typed_submit_guardrail() -> None:
 # Section 2: parallel sub-agents (Criterion 5) — one brief per lab
 # ---------------------------------------------------------------------------
 
-def demo_per_lab_briefs(docs: dict[str, str], conn: Any) -> list[LabBrief]:
+def demo_per_lab_briefs(docs: dict[str, str], conn: Any, run_logger: RunLogger | None = None) -> list[LabBrief]:
     banner("spawn_agents — one sub-agent per lab, in parallel")
     labs = ["Lab Alpha", "Lab Beta", "Lab Gamma"]
     jobs = [
@@ -145,6 +155,7 @@ def demo_per_lab_briefs(docs: dict[str, str], conn: Any) -> list[LabBrief]:
                 "notable_claims=[2-4 short strings]."
             ),
             "scope": {"docs": docs, "conn": conn},
+            "agent_label": f"sub-{lab.lower().replace(' ', '-')}",
         }
         for lab in labs
     ]
@@ -155,6 +166,7 @@ def demo_per_lab_briefs(docs: dict[str, str], conn: Any) -> list[LabBrief]:
         model=build_model(),
         max_steps=10,
         additional_authorized_imports=["json"],
+        run_logger=run_logger,
     )
     for b in briefs:
         score_str = f"{b.headline_score:.0%}" if b.headline_score is not None else "n/a"
@@ -166,7 +178,13 @@ def demo_per_lab_briefs(docs: dict[str, str], conn: Any) -> list[LabBrief]:
 # Section 3: main agent (Criteria 1–4) — synthesises across briefs + corpus
 # ---------------------------------------------------------------------------
 
-def demo_synthesis(docs: dict[str, str], conn: Any, briefs: list[LabBrief]) -> ComparisonReport:
+def demo_synthesis(
+    docs: dict[str, str],
+    conn: Any,
+    briefs: list[LabBrief],
+    run_logger: RunLogger | None = None,
+    repo: WorkspaceRepo | None = None,
+) -> ComparisonReport:
     banner("Main agent — persistent scope, drop-in tools, pre-loaded scope, typed submit")
 
     findings: list[dict] = []
@@ -181,6 +199,9 @@ def demo_synthesis(docs: dict[str, str], conn: Any, briefs: list[LabBrief]) -> C
             "briefs": [b.model_dump() for b in briefs],
         },
         additional_authorized_imports=["json"],
+        run_logger=run_logger,
+        agent_label="main",
+        repo=repo,
     )
 
     schema_hint = (
@@ -222,6 +243,9 @@ def demo_synthesis(docs: dict[str, str], conn: Any, briefs: list[LabBrief]) -> C
 
     console.print(Panel(result.model_dump_json(indent=2), title="ComparisonReport (typed)", border_style="green"))
     assert isinstance(result, ComparisonReport), f"expected ComparisonReport, got {type(result)!r}"
+    if run_logger is not None:
+        run_logger.event("final_report", result)
+        run_logger.event("findings_final", findings)
     return result
 
 
@@ -233,15 +257,24 @@ def main() -> None:
     require_model_credentials()
     demo_typed_submit_guardrail()
 
+    run_logger = RunLogger()
+    console.print(f"[dim]Logging full run to {run_logger.path}[/dim]")
+
+    repo = WorkspaceRepo("workspace")
+    console.print(f"[dim]Workspace git repo: {repo.path} (Turn 0 committed)[/dim]")
+
     docs, conn = load_corpus()
     console.print(f"[dim]Loaded corpus: {len(docs)} docs, "
                   f"{conn.execute('SELECT COUNT(*) FROM benchmarks').fetchone()[0]} benchmark rows, "
                   f"{conn.execute('SELECT COUNT(*) FROM costs').fetchone()[0]} cost rows.[/dim]")
 
-    briefs = demo_per_lab_briefs(docs, conn)
-    demo_synthesis(docs, conn, briefs)
+    briefs = demo_per_lab_briefs(docs, conn, run_logger=run_logger)
+    demo_synthesis(docs, conn, briefs, run_logger=run_logger, repo=repo)
 
+    run_logger.event("run_end", {"ok": True})
     console.print(Rule("[bold green]All five Phase-1 criteria exercised.[/bold green]"))
+    console.print(f"[dim]Full transcript: {run_logger.path}[/dim]")
+    console.print(f"[dim]Inspect workspace: cd {repo.path} && git log --oneline[/dim]")
 
 
 if __name__ == "__main__":

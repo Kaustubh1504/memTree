@@ -1,8 +1,8 @@
-# MemTree — Phase 1: MemEx replication
+# MemTree
 
-A from-scratch replication of the MemEx code-as-action architecture (Databricks AI Research, May 2026) using HuggingFace's `smolagents`. Phase 1 goal: a working MemEx-style agent with all four primitives, demonstrated on a multi-document research synthesis task. Phase 2 (later) adds git history and dashboard.
+A code-as-action agent whose code history is a real git repository. Inspired by Databricks' MemEx paper (May 2026), using HuggingFace's `smolagents`. The four MemEx primitives are working (Phase 1, done). Phase 2 adds git-backed turn history and a Streamlit dashboard.
 
-Not built on MemEx (internal Databricks framework on `aroll`). Clean-room replication of the public paper.
+Not built on MemEx (internal Databricks framework on `aroll`). Clean-room replication of the public paper plus original git-history and dashboard layers.
 
 ## Behavioral guidelines
 
@@ -34,94 +34,60 @@ Ask: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 **Define success criteria. Loop until verified.**
 For multi-step tasks, state a brief plan with verify steps per step.
 
-## The four MemEx primitives
+## Status
 
-From the paper, MemEx extends code-as-action with four additions:
+- **Phase 1: COMPLETE.** MemEx primitives working: persistent kernel via smolagents, drop-in tools, live scope at rollout start, typed `submit()`, `spawn_agent()` with thread-pool parallelism. Demo task: multi-document research synthesis.
+- **Phase 2: IN PROGRESS.** Git-backed turn history + Streamlit dashboard.
 
-1. **Drop-in tools** — existing tool-calling tools become typed Python functions with schemas preserved
-2. **Live scope at rollout start** — pre-loaded variables and objects in the agent's namespace before turn 1
-3. **Typed `submit()`** — final answer validated against a Pydantic schema
-4. **`spawn_agent()`** — spawn sub-agents in parallel, sharing scope, gathering typed results
+## The four MemEx primitives (Phase 1, done)
 
-The same ReAct loop runs MemEx and Tool Calling. Only the action space changes.
+1. **Drop-in tools** — handled by smolagents' `@tool` decorator
+2. **Live scope at rollout start** — `agent.python_executor.state[...] = ...` before `run()`
+3. **Typed `submit()`** — `TypedFinalAnswerTool` validates against a Pydantic model
+4. **`spawn_agent()`** — instantiates a sub-`CodeAgent`, injects scope, runs sync, returns typed result. Parallelism via `ThreadPoolExecutor`. Documented divergence from MemEx's async API.
 
-## Mapping to smolagents
+## Phase 2: git history + dashboard
 
-| Primitive | smolagents has | We build |
-|---|---|---|
-| Persistent Python kernel | `CodeAgent` + `LocalPythonExecutor` | nothing |
-| Drop-in tools | `@tool` decorator | nothing |
-| Live scope | `executor.state` dict | helper to inject before `run()` |
-| Typed `submit()` | untyped `FinalAnswerTool` | `TypedFinalAnswerTool` with Pydantic validation |
-| `spawn_agent()` | nothing native | sync `spawn_agent(task, scope, return_type)`; parallelism via `ThreadPoolExecutor` |
+Every code block the agent writes becomes a real git commit in a real workspace repo. The dashboard is a repo browser with commit log, code view, and kernel state.
 
-**Async note:** the MemEx paper shows `await asyncio.gather(spawn_agent(...))` directly in code blocks. smolagents' executor doesn't support top-level await cleanly. Phase 1 compromise: `spawn_agent` is sync; parallelism is internal via thread pool. The agent calls it as `reports = [spawn_agent(...) for entity in entities]` and threads run them concurrently. Documented divergence from MemEx.
+### Architecture additions
 
-## Architecture
+- `memtree/agent.py` — `MemTreeAgent(CodeAgent)` subclass. Overrides `step()` to capture each turn and commit it.
+- `memtree/repo.py` — `WorkspaceRepo` wrapper around `GitPython`. Initializes the workspace, appends each turn's code to `notebook.py`, commits with a turn-numbered message, persists tool outputs to `tool_outputs.json`.
+- `memtree/replay.py` — `replay(repo, up_to_commit)` rebuilds kernel state in a fresh dict by re-executing `notebook.py` up to the given commit, using cached tool outputs.
+- `memtree/primitives/revert.py` — `revert(to_turn, reason)` tool exposed to the agent. Calls `replay`, truncates turn list, creates a new branch from the reverted commit.
+- `memtree/tools/cached.py` — `cached_tool(fn, cache)` decorator. Hashes `(name, args)`, returns cached output on replay.
+- `app.py` — Streamlit dashboard. Three panels: commit log, code view (with `streamlit-ace`), kernel state summary.
 
-- `memtree/kernel.py` — wrapper around `CodeAgent` with primitives wired in
-- `memtree/primitives/typed_submit.py` — `TypedFinalAnswerTool`, validates against a Pydantic model
-- `memtree/primitives/spawn.py` — `spawn_agent(task, scope, return_type)` with thread-pool parallelism
-- `memtree/primitives/scope.py` — `inject_scope(agent, **variables)` helper
-- `memtree/tools/` — `search_documents.py`, `read_section.py`, `query_db.py`, `save_finding.py`
-- `memtree/corpus/` — pre-loaded document corpus + small SQLite DB (the data)
-- `examples/research_synthesis.py` — CLI demo exercising all four primitives
+### Workspace layout (created at session start)
 
-No dashboard. No git. Just the agent.
+```
+workspace/
+├── .git/                # real git repo
+├── notebook.py          # agent's growing code with `# Turn N` markers
+├── tool_outputs.json    # cached outputs keyed by hash(tool_name + args)
+└── state_summary.json   # variable names, types, shapes — written by agent after each turn
+```
 
-## The demo task
+### Phase 2 build order
 
-**Multi-document research synthesis** — mirrors the shape of OfficeQA Pro at small scale.
+1. **Turn capture.** Override `MemTreeAgent.step()`. Log every captured `Turn` to console. Verify code, stdout, tool outputs all populate. **Print one `memory_step` first to confirm the exact field names smolagents uses on your installed version.**
+2. **Git commits.** After each captured turn, append to `notebook.py` and create a git commit. Run a full demo, open the workspace folder, `git log` shows one commit per turn.
+3. **Replay + revert.** Implement `replay(repo, sha)` using cached tool outputs. Expose `revert` tool to the agent. Test by triggering a manual revert mid-rollout and confirming the kernel state matches.
+4. **Streamlit dashboard.** Read-only first: commit log + notebook contents from the selected commit. Add the "Checkout selected commit" button last.
 
-Pre-loaded scope:
-- 6-10 markdown documents in a real topic area
-- A small SQLite DB with related quantitative data (a few tables, maybe 50-200 rows total)
-- The four tools registered as Python functions
+Verify each step works before moving to the next.
 
-Example task (substitute any topic where comparison matters):
-> "Compare how three [companies/labs/governments] approached [some topic] over [time period]. Identify common themes, disagreements, and one factual inconsistency between qualitative claims in the documents and quantitative numbers in the database. Return a structured `ComparisonReport`."
+## Key design decisions (do not relitigate)
 
-What this exercises:
-- **Persistent scope:** findings accumulate across turns as the agent reads each document
-- **Drop-in tools:** four typed functions callable as Python
-- **Pre-loaded scope:** documents and DB available from turn 1
-- **Typed submit:** `ComparisonReport(themes: list[Theme], disagreements: list[Disagreement], inconsistency: Inconsistency)`
-- **spawn_agent:** one sub-agent per entity being compared, parent aggregates
-
-### Choosing the corpus
-
-Pick a topic where the comparison is genuinely interesting and the data is public. Suggestions:
-- Recent agent-eval papers from different research groups (most on-topic for the audience)
-- AI lab public statements over a year on a specific issue (safety policy, open-weights, scaling)
-- Climate policy positions from different governments
-- Public earnings-call segments from companies in the same sector
-
-The corpus should be small enough to bundle in the repo (under a few MB total) but realistic enough that the task isn't trivially solvable from one document.
-
-## Phase 1 success criteria
-
-The demo script must show:
-
-1. **Persistent scope** — turn 1 loads a document; turn 3 references it without reloading
-2. **Drop-in tools** — `@tool` functions callable inside code blocks
-3. **Pre-loaded scope** — document corpus and DB connection already exist in turn 1
-4. **Typed submit** — final answer is a Pydantic-validated `ComparisonReport`; schema violations raise
-5. **Parallel sub-agents** — agent spawns N sub-agents (one per entity), gets N typed results, aggregates into the final report
-
-Single command: `python -m examples.research_synthesis` exercises all five.
-
-## Implementation order
-
-1. Vanilla `CodeAgent` with Gemini Flash on a trivial task
-2. Verify persistent scope holds across turns (small test)
-3. Build the corpus: pick a topic, gather 6-10 markdown files, generate a small related SQLite DB
-4. Implement the four tools, each with full type hints and docstrings
-5. Inject pre-loaded scope via `agent.python_executor.state[...] = ...` before `run()`
-6. `TypedFinalAnswerTool` — subclass smolagents' final answer tool, validate args against a passed Pydantic class
-7. `spawn_agent` — function that instantiates sub-`CodeAgent`, injects scope, runs sync, returns typed result. Wrap parallel calls in `ThreadPoolExecutor`.
-8. Write `research_synthesis.py` exercising all five criteria
-
-Verify each step works before moving on.
+1. **Real git, not a homegrown log.** `GitPython`. Free diffs, log, checkout, branches.
+2. **One file accumulates the agent's code.** `notebook.py` grows turn-by-turn with `# Turn N: <summary>` markers.
+3. **Tool outputs cached alongside code.** `tool_outputs.json` is committed with each turn. Replay is deterministic and cheap.
+4. **Kernel state is rebuilt, not snapshotted.** No `dill`, no deepcopy. Replay from turn 0 forward in a fresh kernel.
+5. **Turn 0 is the starter scratchpad, locked.** Initial commit contains the corpus + tools. Cannot revert past.
+6. **Use smolagents.** No homegrown ReAct loop, LLM client, or executor.
+7. **`spawn_agent` is sync with internal thread-pool parallelism.** Documented divergence from MemEx's `asyncio.gather`.
+8. **Dashboard and agent are decoupled via the filesystem.** Agent writes to git + state_summary.json. Dashboard polls the workspace every 2 seconds. No IPC needed.
 
 ## Dependencies
 
@@ -131,43 +97,76 @@ name = "memtree"
 requires-python = ">=3.11"
 dependencies = [
     "smolagents>=1.0",
+    "litellm>=1.40",
+    "GitPython>=3.1",
+    "streamlit>=1.30",
+    "streamlit-ace>=0.1.1",
+    "streamlit-autorefresh>=1.0",
     "pandas>=2.0",
     "pydantic>=2.0",
     "rich>=13.0",
 ]
 ```
 
-No Streamlit, no GitPython, no pandasql in Phase 1.
+Do not add: `dill`, `cloudpickle`, `IPython`, `langchain`, `crewai`, `langgraph`.
+
+Requires `git` installed on the system.
 
 ## Run
 
 ```bash
 uv pip install -e .
-export GEMINI_API_KEY=...   # https://aistudio.google.com/apikey
+
+# Model: qwen3.7-max via DashScope International (1M free tokens on signup)
+export DASHSCOPE_API_KEY=sk-...
+export QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+export QWEN_MODEL=qwen3.7-max
+
+# Phase 1 CLI demo (no dashboard)
 python -m examples.research_synthesis
+
+# Phase 2 dashboard
+streamlit run app.py
 ```
 
-Default model: `gemini/gemini-2.5-flash` via smolagents' `LiteLLMModel`.
+Model config:
 
-## Key design decisions
+```python
+model = LiteLLMModel(
+    model_id=f"openai/{os.getenv('QWEN_MODEL')}",
+    api_base=os.getenv("QWEN_BASE_URL"),
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+)
+```
 
-1. **Use smolagents, don't replace it.** No homegrown ReAct loop, executor, or LLM client.
-2. **Each primitive is its own module.** Composable, replaceable.
-3. **`spawn_agent` is sync with internal thread-pool parallelism.** Documented divergence from MemEx's async API.
-4. **No persistence.** Phase 1 is in-memory only.
-5. **Demo task mirrors OfficeQA Pro shape.** Multi-document + structured data, not just a CSV.
+Pass `extra_body={"enable_thinking": False}` if smolagents exposes it — qwen3.7-max is a reasoning model and enabling thinking burns tokens fast.
+
+## Demo story (Phase 2)
+
+1. Dashboard open. Empty commit log on the left. Notebook viewer in the center. Kernel state panel on the right.
+2. User submits the research-synthesis prompt.
+3. Agent works: turn 1, 2, 3 commits populate live as the agent writes code. Right panel shows variables appearing in scope.
+4. Turn N: agent makes a recoverable mistake (drops the wrong column, mutates a DataFrame in place). Kernel state panel shows the corrupted variable.
+5. Recovery path (either):
+   - Agent calls `revert(to_turn=N-1, reason="dropped wrong column")` and retries — visible as a new branch in the commit log
+   - User clicks the turn N-1 commit, hits "Checkout selected commit," nudges the agent forward
+6. Agent retries, succeeds.
+7. User clicks any past commit, sees the exact code at that point. Optionally clicks "Diff vs HEAD" to compare turns.
+
+Whole thing in under 60 seconds. The repo-browser visual is the hook.
 
 ## Avoid
 
-- Custom Python executor (smolagents has `LocalPythonExecutor`)
-- Custom ReAct loop (smolagents has `CodeAgent.run()`)
-- Dashboard or git work — Phase 2
-- Top-level async support — `ThreadPoolExecutor` is enough for Phase 1
-- A single-CSV demo task — too narrow for the architecture
-- Premature optimization
+- State snapshotting via `dill`, `copy.deepcopy` of kernel globals, or anything similar
+- Sandboxing (`RestrictedPython`, subprocess isolation)
+- Async, locking, concurrency primitives (except the `ThreadPoolExecutor` inside `spawn_agent`)
+- Multi-file workspace — one `notebook.py` is enough
+- Agent-driven git branching — branching happens via dashboard `edit_turn` only
+- Premature abstraction — one file per layer until something forces a split
+- Tests for dashboard code; cover replay logic and turn diff logic only
 
 ## Framing
 
-External pitch: "clean-room replication of the MemEx architecture using open-source smolagents, demoed on a multi-document research synthesis task that mirrors OfficeQA Pro at small scale."
+External pitch: "code-as-action agent inspired by MemEx, with the agent's code blocks committed to a real git repo. Dashboard is a repo browser. Checkout any commit to rebuild kernel state via replay. Phase 1 replicates the MemEx primitives on smolagents; Phase 2 adds the history layer."
 
 Never "built on MemEx" or "extends MemEx".

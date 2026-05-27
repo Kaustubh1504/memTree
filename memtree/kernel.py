@@ -11,11 +11,14 @@ import os
 from typing import Any, Type
 
 from pydantic import BaseModel
-from smolagents import CodeAgent, LiteLLMModel
+from smolagents import LiteLLMModel
 from smolagents.tools import Tool
 
+from memtree.agent import MemTreeAgent
+from memtree.primitives.revert import make_revert_tool
 from memtree.primitives.scope import inject_scope
 from memtree.primitives.typed_submit import TypedFinalAnswerTool
+from memtree.tools.cached import ToolCache, attach_cache
 
 # Model + endpoint are env-driven so the same code runs against Gemini on a
 # laptop and a vLLM server on an HPC GPU node without edits.
@@ -47,8 +50,11 @@ def build_agent(
     final_answer_type: Type[BaseModel] | None = None,
     scope: dict[str, Any] | None = None,
     additional_authorized_imports: list[str] | None = None,
+    run_logger: Any | None = None,
+    agent_label: str = "main",
+    repo: Any | None = None,
     **agent_kwargs: Any,
-) -> CodeAgent:
+) -> MemTreeAgent:
     """Build a CodeAgent with MemEx primitives wired in.
 
     Args:
@@ -57,19 +63,43 @@ def build_agent(
         final_answer_type: Pydantic model the agent's `final_answer(...)` must satisfy.
         scope: variables to pre-load into the agent's namespace before turn 1.
         additional_authorized_imports: extra modules the executor may import.
+        run_logger: optional `RunLogger` to capture every memory step.
+        agent_label: tag attached to log lines so main/sub-agents can be told apart.
     """
     tools = list(tools or [])
     if final_answer_type is not None:
         tools.append(TypedFinalAnswerTool(final_answer_type))
 
-    agent = CodeAgent(
+    # When a workspace repo is attached, auto-wrap tools so their outputs are
+    # written to repo.tool_outputs_path. This is what replay() consumes later.
+    cache: ToolCache | None = None
+    if repo is not None:
+        cache = ToolCache(path=repo.tool_outputs_path)
+        cache.load()
+        attach_cache(tools, cache)
+
+    if run_logger is not None:
+        existing = agent_kwargs.get("step_callbacks") or []
+        if isinstance(existing, dict):
+            existing = list(existing.values())
+        agent_kwargs["step_callbacks"] = list(existing) + [run_logger.step_callback(agent_label)]
+
+    agent = MemTreeAgent(
         tools=tools,
         model=model or build_model(),
         additional_authorized_imports=additional_authorized_imports or [],
+        agent_label=agent_label,
+        repo=repo,
         **agent_kwargs,
     )
+    agent.tool_cache = cache  # type: ignore[attr-defined]
 
     if scope:
         inject_scope(agent, **scope)
+
+    # `revert` is only meaningful when there's a repo to walk back through.
+    if repo is not None:
+        revert_tool = make_revert_tool(agent, scope or {})
+        agent.tools[revert_tool.name] = revert_tool
 
     return agent
